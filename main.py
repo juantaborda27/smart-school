@@ -8,7 +8,7 @@ y las almacena en MongoDB.
 import logging
 import os
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Literal, Optional
 
 from dotenv import load_dotenv
@@ -61,6 +61,23 @@ class LecturaSensor(BaseModel):
 
 class RespuestaCreacion(BaseModel):
     id: str
+
+
+class ConsumoDiario(BaseModel):
+    """Consumo de agua agregado por día (y opcionalmente por sensor)."""
+
+    dia: str = Field(..., examples=["2026-10-26"])
+    sensor_id: Optional[str] = None
+    ubicacion: Optional[str] = None
+    bloque: Optional[int] = None
+    litros_totales: float
+    caudal_maximo_l_min: float
+    lecturas: int
+    anomalias: int
+
+
+# Colombia no usa horario de verano: UTC-5 fijo
+ZONA_COLOMBIA = timezone(timedelta(hours=-5))
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +195,70 @@ async def listar_lecturas(
         .limit(limite)
     )
     return await cursor.to_list(length=limite)
+
+
+@app.get("/api/consumo-diario", response_model=list[ConsumoDiario])
+async def consumo_diario(
+    request: Request,
+    sensor_id: Optional[str] = Query(default=None, description="Filtrar por sensor"),
+    bloque: Optional[int] = Query(default=None, ge=0, description="Filtrar por bloque"),
+    desde: Optional[date] = Query(default=None, description="Fecha inicial (YYYY-MM-DD), inclusive"),
+    hasta: Optional[date] = Query(default=None, description="Fecha final (YYYY-MM-DD), inclusive"),
+    por_sensor: bool = Query(default=True, description="Si es false, suma todos los sensores por día"),
+    incluir_sinteticos: bool = Query(default=True, description="Incluir datos sintéticos"),
+    limite: int = Query(default=100, ge=1, le=1000, description="Cantidad máxima de resultados"),
+):
+    """Consumo de agua por día (hora de Colombia), sumando los litros de cada intervalo."""
+    filtro: dict = {}
+    if sensor_id is not None:
+        filtro["sensor_id"] = sensor_id
+    if bloque is not None:
+        filtro["bloque"] = bloque
+    if not incluir_sinteticos:
+        filtro["dato_sintetico"] = False
+
+    rango: dict = {}
+    if desde is not None:
+        rango["$gte"] = datetime.combine(desde, time.min, tzinfo=ZONA_COLOMBIA)
+    if hasta is not None:
+        rango["$lt"] = datetime.combine(hasta + timedelta(days=1), time.min, tzinfo=ZONA_COLOMBIA)
+    if rango:
+        filtro["fecha_hora"] = rango
+
+    dia = {"$dateToString": {"format": "%Y-%m-%d", "date": "$fecha_hora", "timezone": "-05:00"}}
+    grupo: dict = {
+        "_id": {"dia": dia, "sensor_id": "$sensor_id"} if por_sensor else {"dia": dia},
+        "litros_totales": {"$sum": "$litros_consumidos_intervalo"},
+        "caudal_maximo": {"$max": "$caudal_l_min"},
+        "lecturas": {"$sum": 1},
+        "anomalias": {"$sum": {"$cond": ["$es_anomalia", 1, 0]}},
+    }
+    if por_sensor:
+        grupo["ubicacion"] = {"$first": "$ubicacion"}
+        grupo["bloque"] = {"$first": "$bloque"}
+
+    pipeline = [
+        {"$match": filtro},
+        {"$group": grupo},
+        {"$sort": {"_id.dia": -1, "_id.sensor_id": 1}},
+        {"$limit": limite},
+    ]
+
+    documentos = await request.app.state.coleccion.aggregate(pipeline).to_list(length=limite)
+
+    return [
+        ConsumoDiario(
+            dia=d["_id"]["dia"],
+            sensor_id=d["_id"].get("sensor_id"),
+            ubicacion=d.get("ubicacion"),
+            bloque=d.get("bloque"),
+            litros_totales=round(d["litros_totales"], 3),
+            caudal_maximo_l_min=round(d["caudal_maximo"], 2),
+            lecturas=d["lecturas"],
+            anomalias=d["anomalias"],
+        )
+        for d in documentos
+    ]
 
 
 @app.get("/health")
